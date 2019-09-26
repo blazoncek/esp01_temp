@@ -21,7 +21,7 @@
 /*
 #include <OneWire.h>
 #include <DallasTemperature.h>
-#define ONEWIRE D2          // use pin D2
+#define ONEWIRE 1          // use pin D2
 #define TEMPERATURE_PRECISION 9
 OneWire oneWire(ONEWIRE);   // on pin D2 (a 4.7K pull-up resistor is necessary)
 DallasTemperature sensors(&oneWire);
