@@ -23,19 +23,18 @@
 
 #define TEMPERATURE_PRECISION 9
 #define ONEWIRE 2
-OneWire oneWire(ONEWIRE);         // pin GPIO2 (a 4.7K pull-up resistor is necessary)
-DallasTemperature sensors(&oneWire);
+OneWire *oneWire;                 // pin GPIO2 (a 4.7K pull-up resistor is necessary)
+DallasTemperature *sensors;
 DeviceAddress *thermometers[10];  // arrays to hold device addresses (up to 10)
 int numThermometers = 0;
 
 // DHT type temperature/humidity sensors
 #define DHTPIN  2           // what pin we're connected to (default GPIO2=2, GPIO0=3, RX=4, TX=5)
-#define DHTTYPE DHT11       // DHT11, DHT22
-DHT dht(DHTPIN, DHTTYPE);   // Initialize DHT sensor
 float tempAdjust = 0.0;     // temperature adjustment for wacky DHT sensors (retrieved from EEPROM)
+DHT *dht = NULL;            // DHT11, DHT22, DHT21, none(0)
 
 // relay pins
-const int relays[4] = {2, 3, 4, 5};     // relay pins
+const int relays[4] = {3, 2, 4, 5};     // relay pins (GPIO0, GPIO2, RX, TX)
 int relayState[4] = {0, 0, 0, 0};       // relay states
 int numRelays = 0;                      // number of relays used
 
@@ -54,7 +53,7 @@ char c_onewire[2]    = "0";
 bool shouldSaveConfig = false;
 
 long lastMsg = 0;
-char msg[50];
+char msg[256];
 char mac_address[16];
 char inTopic[64];   // add MAC address in WiFi setup code
 char outTopic[64];  // add MAC address in WiFi setup code
@@ -74,8 +73,7 @@ void saveConfigCallback ();
 void callback(char* topic, byte* payload, unsigned int length) {
 
   if ( strstr(topic,"/temperature/command") ) {
-    // insert temperature adjustment and store it into non volatile memory
-    
+    // insert temperature adjustment and store it into non-volatile memory
     char tmp[8];
     strncpy(tmp,(char*)payload,length>7? 7: length);
     tmp[length>7? 7: length] = '\0'; // terminate string
@@ -108,7 +106,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
       sprintf(msg, relayState[relayId]?"on":"off");
       client.publish(outTopic, msg);
 
-      // permanently store relay states to nonvolatile memory
+      // permanently store relay states to non-volatile memory
       int b=0;
       for ( int i=numRelays; i>0; i-- ) {
         b = (b<<1) | (relayState[i-1]&1);
@@ -131,9 +129,6 @@ void setup() {
   // Initialize the BUILTIN_LED pin as an output & set initial state LED on
   pinMode(BUILTIN_LED, OUTPUT);
   digitalWrite(BUILTIN_LED, LOW);
-  // change RX/TX pins into GPIO output pins (for relays)
-  pinMode(3, OUTPUT);     // RX -> GPIO1
-  pinMode(4, OUTPUT);     // TX -> GPIO3
 
   String WiFiMAC = WiFi.macAddress();
   WiFiMAC.replace(":","");
@@ -213,7 +208,7 @@ void setup() {
   wifiManager.addParameter(&custom_dhttype);
   wifiManager.addParameter(&custom_onewire);
 
-  // set minimu quality of signal so it ignores AP's under that quality
+  // set minimum quality of signal so it ignores AP's under that quality
   // defaults to 8%
   //wifiManager.setMinimumSignalQuality(10);
   
@@ -296,6 +291,11 @@ void setup() {
 
   if ( numRelays > 0 ) {
     // initialize relay pins
+    if ( numRelays > 2 ) {
+      // change RX/TX pins into GPIO output pins (for relays)
+      pinMode(3, OUTPUT);     // RX -> GPIO1
+      pinMode(4, OUTPUT);     // TX -> GPIO3
+    }
     // 10th byte contain 8 relays (bits) worth of initial states
     int initRelays = EEPROM.read(9);
     // relay states are stored in bits
@@ -317,22 +317,24 @@ void setup() {
   if ( atoi(c_onewire) ) {
     // OneWire temperature sensors
     byte *tmpAddr, addr[8];
+
+    oneWire = new OneWire(ONEWIRE);             // no need to free this one
+    sensors = new DallasTemperature(oneWire);   // no need to free this one, too
   
     // Start up the library
-    sensors.begin();
+    sensors->begin();
   
     // locate devices on the bus
-    numThermometers = sensors.getDeviceCount();
-    oneWire.reset_search();
-    for ( int i=0; !oneWire.search(addr) && i<10; i++ ) {
+    numThermometers = sensors->getDeviceCount();
+    oneWire->reset_search();
+    for ( int i=0; !oneWire->search(addr) && i<10; i++ ) {
       if ( OneWire::crc8(addr, 7) != addr[7] ) {
-        Serial.println("CRC error.");
         thermometers[i] = NULL;
       } else {
         // store up to 16 sensor addresses
         tmpAddr = (byte*)malloc(8); // there is no need to free() this memory
         memcpy(tmpAddr,addr,8);
-        sensors.setResolution(tmpAddr, TEMPERATURE_PRECISION);
+        sensors->setResolution(tmpAddr, TEMPERATURE_PRECISION);
         thermometers[i] = (DeviceAddress *)tmpAddr;
       }
     }
@@ -355,9 +357,9 @@ void loop() {
   }
   client.loop();
 
-  // publish status every 60s
+  // publish status every 120s
   long now = millis();
-  if (now - lastMsg > 60000) {
+  if ( now - lastMsg > 120000 ) {
     lastMsg = now;
     
     if ( dht ) {
@@ -371,23 +373,22 @@ void loop() {
       
       // Check if any reads failed and exit early (to try again).
       if (isnan(h) || isnan(t) || isnan(f)) {
-        Serial.println("Failed to read from DHT sensor!");
         sprintf(outTopic, "%s/%s/sensor/temperature", MQTTBASE, clientId);
         sprintf(msg, "err");
       } else {
         // may use Shelly MQTT API (shellies/shellyht-MAC/sensor/temperature)
         sprintf(outTopic, "%s/%s/sensor/temperature", MQTTBASE, clientId);
-        sprintf(msg, "%.2f", t + tempAdjust);
+        sprintf(msg, "%.1f", t + tempAdjust);
         client.publish(outTopic, msg);
         sprintf(outTopic, "%s/%s/sensor/temperature_f", MQTTBASE, clientId);
-        sprintf(msg, "%.2f", f + tempAdjust*(float)(9/5));
+        sprintf(msg, "%.1f", f + tempAdjust*(float)(9/5));
         client.publish(outTopic, msg);
         sprintf(outTopic, "%s/%s/sensor/humidity", MQTTBASE, clientId);
-        sprintf(msg, "%.2f", h);
+        sprintf(msg, "%.1f", h);
         client.publish(outTopic, msg);
-        if ( round(tempAdjust*10) == 0.0 ) {
+        if ( round(tempAdjust*10) != 0.0 ) {
           sprintf(outTopic, "%s/%s/temp_adjust", MQTTBASE, clientId);
-          sprintf(msg, "%.2f", tempAdjust);
+          sprintf(msg, "%.1f", tempAdjust);
           client.publish(outTopic, msg);
         }
       }
@@ -398,12 +399,12 @@ void loop() {
       for ( int i=0; i<numThermometers; i++ ) {
         if ( *thermometers[i] ) {
           // not a faulty thermometer
-          float tempC = sensors.getTempC(*thermometers[i]);
+          float tempC = sensors->getTempC(*thermometers[i]);
           if ( numThermometers == 1 )
             sprintf(outTopic, "%s/%s/temperature", MQTTBASE, clientId);
           else
             sprintf(outTopic, "%s/%s/temperature/%i", MQTTBASE, clientId, i);
-          sprintf(msg, "%.2f", tempC);
+          sprintf(msg, "%.1f", tempC);
           client.publish(outTopic, msg);
         }
       }
@@ -416,24 +417,32 @@ void loop() {
       client.publish(outTopic, msg);
     }
 
-  // end 60s reporting
+  // end 120s reporting
   }
-
-  // wait 2s until next update (also DHT limitation)
-  delay(2000);
 }
 
 //----------------------------------------------------
 // MQTT reconnect handling
 void reconnect() {
+  char tmp[12];
+
   // Loop until we're reconnected
   while ( !client.connected() ) {
     // Attempt to connect
     if ( strlen(username)==0? client.connect(clientId): client.connect(clientId, username, password) ) {
       // Once connected, publish an announcement...
+      DynamicJsonDocument doc(256);
+      doc["mac"] = WiFi.macAddress(); //.toString().c_str();
+      doc["ip"] = WiFi.localIP().toString();  //.c_str();
+      doc["relays"] = c_relays;
+      doc["dhttype"] = c_dhttype;
+      doc["onewire"] = c_onewire;
+      doc["tempadjust"] = ftoa(tempAdjust, tmp, 2);
+
+      size_t n = serializeJson(doc, msg);
       sprintf(outTopic, "%s/%s/announce", MQTTBASE, clientId);
-      sprintf(msg, "Hello there. My IP is %s", WiFi.localIP().toString().c_str());
       client.publish(outTopic, msg);
+
       // ... and resubscribe
       sprintf(inTopic, "%s/%s/#", MQTTBASE, clientId);
       client.subscribe(inTopic);
