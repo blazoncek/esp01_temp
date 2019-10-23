@@ -15,27 +15,29 @@
 #include <WiFiManager.h>          //https://github.com/tzapu/WiFiManager WiFi Configuration Magic
 #include <PubSubClient.h>
 #include <ArduinoJson.h>          //https://github.com/bblanchon/ArduinoJson
+#include "DHT.h"
+#include <OneWire.h>
+#include <DallasTemperature.h>
 
 #define DEBUG   0
 
-/*
-#include <OneWire.h>
-#include <DallasTemperature.h>
-#define ONEWIRE 1          // use pin D2
 #define TEMPERATURE_PRECISION 9
-OneWire oneWire(ONEWIRE);   // on pin D2 (a 4.7K pull-up resistor is necessary)
+#define ONEWIRE 2
+OneWire oneWire(ONEWIRE);         // pin GPIO2 (a 4.7K pull-up resistor is necessary)
 DallasTemperature sensors(&oneWire);
-// arrays to hold device addresses (up to 16)
-DeviceAddress *thermometers[16];
-int numSensors = 0;
-*/
+DeviceAddress *thermometers[10];  // arrays to hold device addresses (up to 10)
+int numThermometers = 0;
 
 // DHT type temperature/humidity sensors
-#include "DHT.h"
-#define DHTPIN  2      // what pin we're connected to (default D2)
-#define DHTTYPE DHT11   // DHT11, DHT22
-DHT dht(DHTPIN, DHTTYPE); // Initialize DHT sensor
-float tempAdjust = 0.0; // temperature adjustment for wacky DHT sensors (retrieved from EEPROM)
+#define DHTPIN  2           // what pin we're connected to (default GPIO2=2, GPIO0=3, RX=4, TX=5)
+#define DHTTYPE DHT11       // DHT11, DHT22
+DHT dht(DHTPIN, DHTTYPE);   // Initialize DHT sensor
+float tempAdjust = 0.0;     // temperature adjustment for wacky DHT sensors (retrieved from EEPROM)
+
+// relay pins
+const int relays[4] = {2, 3, 4, 5};     // relay pins
+int relayState[4] = {0, 0, 0, 0};       // relay states
+int numRelays = 0;                      // number of relays used
 
 // Update these with values suitable for your network.
 char mqtt_server[40] = "192.168.70.11";
@@ -43,6 +45,10 @@ char mqtt_port[7]    = "1883";
 char username[33]    = "";
 char password[33]    = "";
 char MQTTBASE[16]    = "shellies"; // use shellies for Shelly MQTT Domoticz plugin integration
+
+char c_relays[2]     = "0";
+char c_dhttype[6]    = "none";
+char c_onewire[2]    = "0";
 
 // flag for saving data from WiFiManager
 bool shouldSaveConfig = false;
@@ -67,7 +73,6 @@ void saveConfigCallback ();
 // MQTT callback function
 void callback(char* topic, byte* payload, unsigned int length) {
 
-#ifdef DHTTYPE
   if ( strstr(topic,"/temperature/command") ) {
     // insert temperature adjustment and store it into non volatile memory
     
@@ -83,54 +88,52 @@ void callback(char* topic, byte* payload, unsigned int length) {
       EEPROM.commit();
       EEPROM.end();
     }
+  } else if ( strstr(topic,"/relay/") && strstr(topic,"/command") ) {
+    // topic contains relay command
+
+    int relayId = (int)(*(strstr(topic,"/command")-1) - '0');  // get the relay id (0-3)
+    if ( relayId < numRelays ) {
+      if ( strncmp((char*)payload,"on",length)==0 ) {
+        // message is on
+        digitalWrite(relays[relayId], HIGH);  // Turn the relay on
+        relayState[relayId] = 1;
+      } else if ( strncmp((char*)payload,"off",length)==0 ) {
+        // message is off
+        digitalWrite(relays[relayId], LOW);  // Turn the relay off
+        relayState[relayId] = 0;
+      }
+
+      // publish relay state
+      sprintf(outTopic, "%s/%s/relay/%i", MQTTBASE, clientId, relayId);
+      sprintf(msg, relayState[relayId]?"on":"off");
+      client.publish(outTopic, msg);
+
+      // permanently store relay states to nonvolatile memory
+      int b=0;
+      for ( int i=numRelays; i>0; i-- ) {
+        b = (b<<1) | (relayState[i-1]&1);
+      }
+      EEPROM.begin(10);
+      EEPROM.write(9,b);
+      EEPROM.commit();
+      EEPROM.end();
+    }
   }
-#endif
 }
 
 
 //-----------------------------------------------------------
 // main setup
 void setup() {
+  char str[11];
   delay(5000);
-  Serial.begin(115200);
 
-  // request 10 bytes from EEPROM
-  EEPROM.begin(10);
-
-#ifdef DHTTYPE
-  // initialize DHT sensor
-  dht.begin();
-  char temp[8];
-  EEPROM.get(0,temp);
-  tempAdjust = atof(temp);  // temperature adjustment (set via MQTT message)
-#endif
-
-#ifdef ONEWIRE
-  // OneWire temperature sensors
-  byte *tmpAddr, addr[8];
-
-  // Start up the library
-  sensors.begin();
-
-  // locate devices on the bus
-  numSensors = sensors.getDeviceCount();
-  oneWire.reset_search();
-  for ( int i=0; !oneWire.search(addr) && i<16; i++ ) {
-    if (OneWire::crc8(addr, 7) != addr[7])
-      Serial.println("CRC error.");
-      thermometers[i] = null;
-    else {
-      // store up to 16 sensor addresses
-      tmpAddr = (byte*)malloc(8);
-      memcpy(tmpAddr,addr,8);
-      sensors.setResolution(tmpAddr, TEMPERATURE_PRECISION);
-      thermometers[i] = (DeviceAddress *)tmpAddr;
-    }
-  }
-#endif
-
-  // done reading EEPROM
-  EEPROM.end();
+  // Initialize the BUILTIN_LED pin as an output & set initial state LED on
+  pinMode(BUILTIN_LED, OUTPUT);
+  digitalWrite(BUILTIN_LED, LOW);
+  // change RX/TX pins into GPIO output pins (for relays)
+  pinMode(3, OUTPUT);     // RX -> GPIO1
+  pinMode(4, OUTPUT);     // TX -> GPIO3
 
   String WiFiMAC = WiFi.macAddress();
   WiFiMAC.replace(":","");
@@ -159,14 +162,17 @@ void setup() {
           strcpy(username, doc["username"]);
           strcpy(password, doc["password"]);
           strcpy(password, doc["base"]);
+
+          strcpy(c_relays, doc["relays"]);
+          strcpy(c_dhttype, doc["dhttype"]);
+          strcpy(c_onewire, doc["onewire"]);
         } else {
         }
       }
-    } else {
-      //clean FS, for testing
-      //SPIFFS.format();
     }
   } else {
+    //clean FS, for testing
+    SPIFFS.format();
   }
   //end read
 
@@ -178,6 +184,10 @@ void setup() {
   WiFiManagerParameter custom_username("username", "username", username, 32);
   WiFiManagerParameter custom_password("password", "password", password, 32);
   WiFiManagerParameter custom_mqtt_base("base", "MQTT topic base", MQTTBASE, 15);
+
+  WiFiManagerParameter custom_relays("relays", "Number of relays (0-4)", c_relays, 1);
+  WiFiManagerParameter custom_dhttype("dhttype", "DHT sensor GPIO2 type (DHT11,DHT22,none)", c_dhttype, 5);
+  WiFiManagerParameter custom_onewire("onewire", "OneWire GPIO2 enabled (0/1)", c_onewire, 1);
 
   // WiFiManager
   // Local intialization. Once its business is done, there is no need to keep it around
@@ -198,6 +208,10 @@ void setup() {
   wifiManager.addParameter(&custom_username);
   wifiManager.addParameter(&custom_password);
   wifiManager.addParameter(&custom_mqtt_base);
+
+  wifiManager.addParameter(&custom_relays);
+  wifiManager.addParameter(&custom_dhttype);
+  wifiManager.addParameter(&custom_onewire);
 
   // set minimu quality of signal so it ignores AP's under that quality
   // defaults to 8%
@@ -226,6 +240,24 @@ void setup() {
   strcpy(password, custom_password.getValue());
   strcpy(MQTTBASE, custom_mqtt_base.getValue());
 
+  strcpy(c_relays, custom_relays.getValue());
+  strcpy(c_dhttype, custom_dhttype.getValue());
+  strcpy(c_onewire, custom_onewire.getValue());
+
+  numRelays = max(min(atoi(c_relays),4),0);
+  c_relays[0] = '0' + numRelays;
+
+  if ( strcmp(c_dhttype,"DHT11")==0 ) {
+    dht = new DHT(DHTPIN, DHT11);
+  } else if ( strcmp(c_dhttype,"DHT21")==0 ) {
+    dht = new DHT(DHTPIN, DHT21);
+  } else if ( strcmp(c_dhttype,"DHT22")==0 ) {
+    dht = new DHT(DHTPIN, DHT22);
+  } else {
+    dht = NULL;
+    strcpy(c_dhttype,"none");
+  }
+
   //save the custom parameters to FS
   if ( shouldSaveConfig ) {
     DynamicJsonDocument doc(1024);
@@ -235,16 +267,80 @@ void setup() {
     doc["password"] = password;
     doc["base"] = MQTTBASE;
 
+    doc["relays"] = c_relays;
+    doc["dhttype"] = c_dhttype;
+    doc["onewire"] = c_onewire;
+
     File configFile = SPIFFS.open("/config.json", "w");
     if (!configFile) {
-      Serial.println("failed to open config file for writing");
+      // failed to open config file for writing
     } else {
       serializeJson(doc, configFile);
       configFile.close();
     }
+
+    // clear 10 bytes from EEPROM
+    EEPROM.begin(10);
+    EEPROM.put(10, "0.0\0\0\0\0\0\0\0");
+    EEPROM.commit();
+    EEPROM.end();
+    delay(120);
   }
 //----------------------------------------------------------
+
+  // if connected set state LED off
+  digitalWrite(BUILTIN_LED, HIGH);
+
+  // request 10 bytes from EEPROM
+  EEPROM.begin(10);
+
+  if ( numRelays > 0 ) {
+    // initialize relay pins
+    // 10th byte contain 8 relays (bits) worth of initial states
+    int initRelays = EEPROM.read(9);
+    // relay states are stored in bits
+    for ( int i=0; i<numRelays; i++ ) {
+      pinMode(relays[i], OUTPUT);
+      relayState[i] = (initRelays >> 1) & 1;
+      digitalWrite(relays[i], relayState[i]? HIGH: LOW);
+    }
+  }
   
+  if ( dht ) {
+    // initialize DHT sensor
+    dht->begin();
+    char temp[8];
+    EEPROM.get(0,temp);
+    tempAdjust = atof(temp);  // temperature adjustment (set via MQTT message)
+  }
+
+  if ( atoi(c_onewire) ) {
+    // OneWire temperature sensors
+    byte *tmpAddr, addr[8];
+  
+    // Start up the library
+    sensors.begin();
+  
+    // locate devices on the bus
+    numThermometers = sensors.getDeviceCount();
+    oneWire.reset_search();
+    for ( int i=0; !oneWire.search(addr) && i<10; i++ ) {
+      if ( OneWire::crc8(addr, 7) != addr[7] ) {
+        Serial.println("CRC error.");
+        thermometers[i] = NULL;
+      } else {
+        // store up to 16 sensor addresses
+        tmpAddr = (byte*)malloc(8); // there is no need to free() this memory
+        memcpy(tmpAddr,addr,8);
+        sensors.setResolution(tmpAddr, TEMPERATURE_PRECISION);
+        thermometers[i] = (DeviceAddress *)tmpAddr;
+      }
+    }
+  }
+
+  // done reading EEPROM
+  EEPROM.end();
+
   // initialize MQTT connection & provide callback function
   client.setServer(mqtt_server, atoi(mqtt_port));
   client.setCallback(callback);
@@ -264,48 +360,62 @@ void loop() {
   if (now - lastMsg > 60000) {
     lastMsg = now;
     
-#ifdef DHTTYPE
-    // Reading temperature or humidity takes about 250 milliseconds!
-    // Sensor readings may also be up to 2 seconds 'old' (its a very slow sensor)
-    float h = dht.readHumidity();
-    // Read temperature as Celsius (the default)
-    float t = dht.readTemperature();
-    // Read temperature as Fahrenheit (isFahrenheit = true)
-    //float f = dht.readTemperature(true);
-    
-    // Check if any reads failed and exit early (to try again).
-    if (isnan(h) || isnan(t) /*|| isnan(f)*/) {
-      Serial.println("Failed to read from DHT sensor!");
-      sprintf(outTopic, "%s/%s/sensor/temperature", MQTTBASE, clientId);
-      sprintf(msg, "err");
-      client.publish(outTopic, msg);
-    } else {
-      // may use Shelly MQTT API (shellies/shellyht-MAC/sensor/temperature)
-      sprintf(outTopic, "%s/%s/sensor/temperature", MQTTBASE, clientId);
-      sprintf(msg, "%.2f", t + tempAdjust);
-      client.publish(outTopic, msg);
-      sprintf(outTopic, "%s/%s/sensor/humidity", MQTTBASE, clientId);
-      sprintf(msg, "%.2f", h);
-      client.publish(outTopic, msg);
-      // non-standard Shelly API
-      sprintf(outTopic, "%s/%s/sensor/temphum", MQTTBASE, clientId);
-      sprintf(msg, "%.2f;%.2f", t + tempAdjust, h);
-      client.publish(outTopic, msg);
-    }
-#endif
-
-#ifdef ONEWIRE
-    // may use non-standard Shelly MQTT API (shellies/shellyhtx-MAC/sensor/temperature/i)
-    for ( int i=0; i<numThermometers; i++ ) {
-      if ( *thermometers[i] ) {
-        // not a faulty thermometer
-        float tempC = sensors.getTempC(*thermometers[i]);
-        sprintf(outTopic, "%s/%s/temperature/%i", MQTTBASE, clientId, i);
-        sprintf(msg, "%.2f", tempC);
+    if ( dht ) {
+      // Reading temperature or humidity takes about 250 milliseconds!
+      // Sensor readings may also be up to 2 seconds 'old' (its a very slow sensor)
+      float h = dht->readHumidity();
+      // Read temperature as Celsius (the default)
+      float t = dht->readTemperature();
+      // Read temperature as Fahrenheit (isFahrenheit = true)
+      float f = dht->readTemperature(true);
+      
+      // Check if any reads failed and exit early (to try again).
+      if (isnan(h) || isnan(t) || isnan(f)) {
+        Serial.println("Failed to read from DHT sensor!");
+        sprintf(outTopic, "%s/%s/sensor/temperature", MQTTBASE, clientId);
+        sprintf(msg, "err");
+      } else {
+        // may use Shelly MQTT API (shellies/shellyht-MAC/sensor/temperature)
+        sprintf(outTopic, "%s/%s/sensor/temperature", MQTTBASE, clientId);
+        sprintf(msg, "%.2f", t + tempAdjust);
         client.publish(outTopic, msg);
+        sprintf(outTopic, "%s/%s/sensor/temperature_f", MQTTBASE, clientId);
+        sprintf(msg, "%.2f", f + tempAdjust*(float)(9/5));
+        client.publish(outTopic, msg);
+        sprintf(outTopic, "%s/%s/sensor/humidity", MQTTBASE, clientId);
+        sprintf(msg, "%.2f", h);
+        client.publish(outTopic, msg);
+        if ( round(tempAdjust*10) == 0.0 ) {
+          sprintf(outTopic, "%s/%s/temp_adjust", MQTTBASE, clientId);
+          sprintf(msg, "%.2f", tempAdjust);
+          client.publish(outTopic, msg);
+        }
       }
     }
-#endif
+
+    if ( atoi(c_onewire) ) {
+      // may use non-standard Shelly MQTT API (shellies/shellyhtx-MAC/temperature/i)
+      for ( int i=0; i<numThermometers; i++ ) {
+        if ( *thermometers[i] ) {
+          // not a faulty thermometer
+          float tempC = sensors.getTempC(*thermometers[i]);
+          if ( numThermometers == 1 )
+            sprintf(outTopic, "%s/%s/temperature", MQTTBASE, clientId);
+          else
+            sprintf(outTopic, "%s/%s/temperature/%i", MQTTBASE, clientId, i);
+          sprintf(msg, "%.2f", tempC);
+          client.publish(outTopic, msg);
+        }
+      }
+    }
+
+    // may use Shelly MQTT API (shellies/shelly4pro-MAC/relay/i)
+    for ( int i=0; i<numRelays; i++ ) {
+      sprintf(outTopic, "%s/%s/relay/%i", MQTTBASE, clientId, i);
+      sprintf(msg, relayState[i]?"on":"off");
+      client.publish(outTopic, msg);
+    }
+
   // end 60s reporting
   }
 
