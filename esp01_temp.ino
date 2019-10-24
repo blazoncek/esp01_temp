@@ -55,7 +55,6 @@ bool shouldSaveConfig = false;
 long lastMsg = 0;
 char msg[256];
 char mac_address[16];
-char inTopic[64];   // add MAC address in WiFi setup code
 char outTopic[64];  // add MAC address in WiFi setup code
 char clientId[20];  // MQTT client ID
 
@@ -63,61 +62,10 @@ WiFiClient espClient;
 PubSubClient client(espClient);
 
 // private functions
-void reconnect();
+void mqtt_callback(char*, byte*, unsigned int);
+void mqtt_reconnect();
 char *ftoa(float,char*,int d=2);
 void saveConfigCallback ();
-
-
-//---------------------------------------------------
-// MQTT callback function
-void callback(char* topic, byte* payload, unsigned int length) {
-
-  if ( strstr(topic,"/temperature/command") ) {
-    // insert temperature adjustment and store it into non-volatile memory
-    char tmp[8];
-    strncpy(tmp,(char*)payload,length>7? 7: length);
-    tmp[length>7? 7: length] = '\0'; // terminate string
-    float temp = atof(tmp);
-    if ( temp < 100.0 && temp > -100.0 ) {
-      tempAdjust = temp;
-      ftoa(tempAdjust, tmp, 2);
-      EEPROM.begin(10);
-      EEPROM.put(0, tmp);
-      EEPROM.commit();
-      EEPROM.end();
-    }
-  } else if ( strstr(topic,"/relay/") && strstr(topic,"/command") ) {
-    // topic contains relay command
-
-    int relayId = (int)(*(strstr(topic,"/command")-1) - '0');  // get the relay id (0-3)
-    if ( relayId < numRelays ) {
-      if ( strncmp((char*)payload,"on",length)==0 ) {
-        // message is on
-        digitalWrite(relays[relayId], HIGH);  // Turn the relay on
-        relayState[relayId] = 1;
-      } else if ( strncmp((char*)payload,"off",length)==0 ) {
-        // message is off
-        digitalWrite(relays[relayId], LOW);  // Turn the relay off
-        relayState[relayId] = 0;
-      }
-
-      // publish relay state
-      sprintf(outTopic, "%s/%s/relay/%i", MQTTBASE, clientId, relayId);
-      sprintf(msg, relayState[relayId]?"on":"off");
-      client.publish(outTopic, msg);
-
-      // permanently store relay states to non-volatile memory
-      int b=0;
-      for ( int i=numRelays; i>0; i-- ) {
-        b = (b<<1) | (relayState[i-1]&1);
-      }
-      EEPROM.begin(10);
-      EEPROM.write(9,b);
-      EEPROM.commit();
-      EEPROM.end();
-    }
-  }
-}
 
 
 //-----------------------------------------------------------
@@ -325,17 +273,16 @@ void setup() {
     sensors->begin();
   
     // locate devices on the bus
-    numThermometers = sensors->getDeviceCount();
     oneWire->reset_search();
     for ( int i=0; !oneWire->search(addr) && i<10; i++ ) {
       if ( OneWire::crc8(addr, 7) != addr[7] ) {
-        thermometers[i] = NULL;
+        // not a valid device
       } else {
-        // store up to 16 sensor addresses
+        // store up to 10 sensor addresses
         tmpAddr = (byte*)malloc(8); // there is no need to free() this memory
         memcpy(tmpAddr,addr,8);
         sensors->setResolution(tmpAddr, TEMPERATURE_PRECISION);
-        thermometers[i] = (DeviceAddress *)tmpAddr;
+        thermometers[numThermometers++] = (DeviceAddress *)tmpAddr;
       }
     }
   }
@@ -345,7 +292,7 @@ void setup() {
 
   // initialize MQTT connection & provide callback function
   client.setServer(mqtt_server, atoi(mqtt_port));
-  client.setCallback(callback);
+  client.setCallback(mqtt_callback);
 }
 
 //-----------------------------------------------------------
@@ -353,7 +300,7 @@ void setup() {
 void loop() {
 
   if (!client.connected()) {
-    reconnect();
+    mqtt_reconnect();
   }
   client.loop();
 
@@ -397,16 +344,13 @@ void loop() {
     if ( atoi(c_onewire) ) {
       // may use non-standard Shelly MQTT API (shellies/shellyhtx-MAC/temperature/i)
       for ( int i=0; i<numThermometers; i++ ) {
-        if ( *thermometers[i] ) {
-          // not a faulty thermometer
-          float tempC = sensors->getTempC(*thermometers[i]);
-          if ( numThermometers == 1 )
-            sprintf(outTopic, "%s/%s/temperature", MQTTBASE, clientId);
-          else
-            sprintf(outTopic, "%s/%s/temperature/%i", MQTTBASE, clientId, i);
-          sprintf(msg, "%.1f", tempC);
-          client.publish(outTopic, msg);
-        }
+        float tempC = sensors->getTempC(*thermometers[i]);
+        if ( numThermometers == 1 )
+          sprintf(outTopic, "%s/%s/temperature", MQTTBASE, clientId);
+        else
+          sprintf(outTopic, "%s/%s/temperature/%i", MQTTBASE, clientId, i);
+        sprintf(msg, "%.1f", tempC);
+        client.publish(outTopic, msg);
       }
     }
 
@@ -421,10 +365,61 @@ void loop() {
   }
 }
 
+//---------------------------------------------------
+// MQTT callback function
+void mqtt_callback(char* topic, byte* payload, unsigned int length) {
+
+  if ( strstr(topic,"/temperature/command") ) {
+    // insert temperature adjustment and store it into non-volatile memory
+    char tmp[8];
+    strncpy(tmp,(char*)payload,length>7? 7: length);
+    tmp[length>7? 7: length] = '\0'; // terminate string
+    float temp = atof(tmp);
+    if ( temp < 100.0 && temp > -100.0 ) {
+      tempAdjust = temp;
+      ftoa(tempAdjust, tmp, 2);
+      EEPROM.begin(10);
+      EEPROM.put(0, tmp);
+      EEPROM.commit();
+      EEPROM.end();
+    }
+  } else if ( strstr(topic,"/relay/") && strstr(topic,"/command") ) {
+    // topic contains relay command
+
+    int relayId = (int)(*(strstr(topic,"/command")-1) - '0');  // get the relay id (0-3)
+    if ( relayId < numRelays ) {
+      if ( strncmp((char*)payload,"on",length)==0 ) {
+        // message is on
+        digitalWrite(relays[relayId], HIGH);  // Turn the relay on
+        relayState[relayId] = 1;
+      } else if ( strncmp((char*)payload,"off",length)==0 ) {
+        // message is off
+        digitalWrite(relays[relayId], LOW);  // Turn the relay off
+        relayState[relayId] = 0;
+      }
+
+      // publish relay state
+      sprintf(outTopic, "%s/%s/relay/%i", MQTTBASE, clientId, relayId);
+      sprintf(msg, relayState[relayId]?"on":"off");
+      client.publish(outTopic, msg);
+
+      // permanently store relay states to non-volatile memory
+      int b=0;
+      for ( int i=numRelays; i>0; i-- ) {
+        b = (b<<1) | (relayState[i-1]&1);
+      }
+      EEPROM.begin(10);
+      EEPROM.write(9,b);
+      EEPROM.commit();
+      EEPROM.end();
+    }
+  }
+}
+
 //----------------------------------------------------
 // MQTT reconnect handling
-void reconnect() {
-  char tmp[12];
+void mqtt_reconnect() {
+  char tmp[64];
 
   // Loop until we're reconnected
   while ( !client.connected() ) {
@@ -444,8 +439,8 @@ void reconnect() {
       client.publish(outTopic, msg);
 
       // ... and resubscribe
-      sprintf(inTopic, "%s/%s/#", MQTTBASE, clientId);
-      client.subscribe(inTopic);
+      sprintf(tmp, "%s/%s/#", MQTTBASE, clientId);
+      client.subscribe(tmp);
     } else {
       // Wait 5 seconds before retrying
       delay(5000);
