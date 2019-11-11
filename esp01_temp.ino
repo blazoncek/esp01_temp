@@ -21,10 +21,13 @@
 
 #define DEBUG   0
 
+// NOTE: You cannot use both PIR, DHT & Dallas temperature sensors at the same time
+
+// Dallas DS18B20 temperature sensors
 #define TEMPERATURE_PRECISION 9
-#define ONEWIRE 2
-OneWire *oneWire;                 // pin GPIO2 (a 4.7K pull-up resistor is necessary)
-DallasTemperature *sensors;
+#define ONEWIREPIN 2
+OneWire *oneWire = NULL;          // pin GPIO2 (a 4.7K pull-up resistor is necessary)
+DallasTemperature *sensors = NULL;
 DeviceAddress *thermometers[10];  // arrays to hold device addresses (up to 10)
 int numThermometers = 0;
 
@@ -33,10 +36,16 @@ int numThermometers = 0;
 float tempAdjust = 0.0;     // temperature adjustment for wacky DHT sensors (retrieved from EEPROM)
 DHT *dht = NULL;            // DHT11, DHT22, DHT21, none(0)
 
+// PIR sensor or button/switch pin & state
+int PIRPIN = 2;         // pin used for PIR
+int PIRState = 0;       // initialize PIR state
+
 // relay pins
 const int relays[4] = {3, 2, 4, 5};     // relay pins (GPIO0, GPIO2, RX, TX)
 int relayState[4] = {0, 0, 0, 0};       // relay states
 int numRelays = 0;                      // number of relays used
+// uncomment next line for saving relay states to EEPROM
+//#define EEPROMSAVE 1
 
 // Update these with values suitable for your network.
 char mqtt_server[40] = "192.168.70.11";
@@ -46,8 +55,8 @@ char password[33]    = "";
 char MQTTBASE[16]    = "shellies"; // use shellies for Shelly MQTT Domoticz plugin integration
 
 char c_relays[2]     = "0";
-char c_dhttype[6]    = "none";
-char c_onewire[2]    = "0";
+char c_dhttype[8]    = "none";
+char c_pirsensor[2]  = "0";
 
 // flag for saving data from WiFiManager
 bool shouldSaveConfig = false;
@@ -108,7 +117,7 @@ void setup() {
 
           strcpy(c_relays, doc["relays"]);
           strcpy(c_dhttype, doc["dhttype"]);
-          strcpy(c_onewire, doc["onewire"]);
+          strcpy(c_pirsensor, doc["pirsensor"]);
         } else {
         }
       }
@@ -129,8 +138,8 @@ void setup() {
   WiFiManagerParameter custom_mqtt_base("base", "MQTT topic base", MQTTBASE, 15);
 
   WiFiManagerParameter custom_relays("relays", "Number of relays (0-4)", c_relays, 1);
-  WiFiManagerParameter custom_dhttype("dhttype", "DHT sensor GPIO2 type (DHT11,DHT22,none)", c_dhttype, 5);
-  WiFiManagerParameter custom_onewire("onewire", "OneWire GPIO2 enabled (0/1)", c_onewire, 1);
+  WiFiManagerParameter custom_dhttype("dhttype", "Temp. sensor type (DHT11,DHT22,DS18B20,none)", c_dhttype, 7);
+  WiFiManagerParameter custom_pirsensor("pirsensor", "PIR sensor enabled (0/1)", c_pirsensor, 1);
 
   // WiFiManager
   // Local intialization. Once its business is done, there is no need to keep it around
@@ -154,7 +163,7 @@ void setup() {
 
   wifiManager.addParameter(&custom_relays);
   wifiManager.addParameter(&custom_dhttype);
-  wifiManager.addParameter(&custom_onewire);
+  wifiManager.addParameter(&custom_pirsensor);
 
   // set minimum quality of signal so it ignores AP's under that quality
   // defaults to 8%
@@ -185,7 +194,7 @@ void setup() {
 
   strcpy(c_relays, custom_relays.getValue());
   strcpy(c_dhttype, custom_dhttype.getValue());
-  strcpy(c_onewire, custom_onewire.getValue());
+  strcpy(c_pirsensor, custom_pirsensor.getValue());
 
   numRelays = max(min(atoi(c_relays),4),0);
   c_relays[0] = '0' + numRelays;
@@ -196,8 +205,10 @@ void setup() {
     dht = new DHT(DHTPIN, DHT21);
   } else if ( strcmp(c_dhttype,"DHT22")==0 ) {
     dht = new DHT(DHTPIN, DHT22);
+  } else if ( strcmp(c_dhttype,"DS18B20")==0 ) {
+    oneWire = new OneWire(ONEWIREPIN);          // no need to free this one
+    sensors = new DallasTemperature(oneWire);   // no need to free this one, too
   } else {
-    dht = NULL;
     strcpy(c_dhttype,"none");
   }
 
@@ -212,7 +223,7 @@ void setup() {
 
     doc["relays"] = c_relays;
     doc["dhttype"] = c_dhttype;
-    doc["onewire"] = c_onewire;
+    doc["pirsensor"] = c_pirsensor;
 
     File configFile = SPIFFS.open("/config.json", "w");
     if (!configFile) {
@@ -244,48 +255,54 @@ void setup() {
       pinMode(3, OUTPUT);     // RX -> GPIO1
       pinMode(4, OUTPUT);     // TX -> GPIO3
     }
+    #ifdef EEPROMSAVE
     // 10th byte contain 8 relays (bits) worth of initial states
     int initRelays = EEPROM.read(9);
+    #endif
     // relay states are stored in bits
     for ( int i=0; i<numRelays; i++ ) {
       pinMode(relays[i], OUTPUT);
+      #ifdef EEPROMSAVE
       relayState[i] = (initRelays >> 1) & 1;
+      #endif
       digitalWrite(relays[i], relayState[i]? HIGH: LOW);
     }
   }
   
-  if ( dht ) {
-    // initialize DHT sensor
-    dht->begin();
-    char temp[8];
-    EEPROM.get(0,temp);
-    tempAdjust = atof(temp);  // temperature adjustment (set via MQTT message)
-  }
+  // set up temperature sensor (either DHT or Dallas)
+  if ( strcpy(c_dhttype,"none")!=0 ) {
+    
+    if ( dht ) {
+      // initialize DHT sensor
+      dht->begin();
 
-  if ( atoi(c_onewire) ) {
-    // OneWire temperature sensors
-    byte *tmpAddr, addr[8];
-
-    oneWire = new OneWire(ONEWIRE);             // no need to free this one
-    sensors = new DallasTemperature(oneWire);   // no need to free this one, too
+      // get temperature adjustment fro EEPROM
+      char temp[8];
+      EEPROM.get(0,temp);
+      tempAdjust = atof(temp);  // temperature adjustment (set via MQTT message)
+    } // DHT
   
-    // Start up the library
-    sensors->begin();
-  
-    // locate devices on the bus
-    oneWire->reset_search();
-    for ( int i=0; !oneWire->search(addr) && i<10; i++ ) {
-      if ( OneWire::crc8(addr, 7) != addr[7] ) {
-        // not a valid device
-      } else {
-        // store up to 10 sensor addresses
-        tmpAddr = (byte*)malloc(8); // there is no need to free() this memory
-        memcpy(tmpAddr,addr,8);
-        sensors->setResolution(tmpAddr, TEMPERATURE_PRECISION);
-        thermometers[numThermometers++] = (DeviceAddress *)tmpAddr;
+    if ( oneWire ) {
+      // OneWire temperature sensors
+      byte *tmpAddr, addr[8];
+    
+      // Start up the library
+      sensors->begin();
+    
+      // locate devices on the bus
+      oneWire->reset_search();
+      for ( int i=0; !oneWire->search(addr) && i<10; i++ ) {
+        if ( OneWire::crc8(addr, 7) != addr[7] ) {
+        } else {
+          // store up to 10 sensor addresses
+          tmpAddr = (byte*)malloc(8); // there is no need to free() this memory
+          memcpy(tmpAddr,addr,8);
+          sensors->setResolution(tmpAddr, TEMPERATURE_PRECISION);
+          thermometers[numThermometers++] = (DeviceAddress *)tmpAddr;
+        }
       }
-    }
-  }
+    } // end oneWire
+  } // end temperature sensors
 
   // done reading EEPROM
   EEPROM.end();
@@ -341,7 +358,7 @@ void loop() {
       }
     }
 
-    if ( atoi(c_onewire) ) {
+    if ( oneWire ) {
       // may use non-standard Shelly MQTT API (shellies/shellyhtx-MAC/temperature/i)
       for ( int i=0; i<numThermometers; i++ ) {
         float tempC = sensors->getTempC(*thermometers[i]);
@@ -361,8 +378,27 @@ void loop() {
       client.publish(outTopic, msg);
     }
 
+    if ( atoi(c_pirsensor) ) {
+      // may use Shelly MQTT API as (shellies/shellysense-MAC/sensor/motion)
+      sprintf(outTopic, "%s/%s/sensor/motion", MQTTBASE, clientId);
+      client.publish(outTopic, PIRState == HIGH? "1": "0");
+    }
+
   // end 120s reporting
   }
+  
+  if ( atoi(c_pirsensor) ) {
+    // detect motion and publish immediately
+    int lPIRState = digitalRead(PIRPIN);
+    if (lPIRState != PIRState ) {
+      PIRState = lPIRState;
+      sprintf(outTopic, "%s/%s/sensor/motion", MQTTBASE, clientId);
+      client.publish(outTopic, PIRState == HIGH? "1": "0");
+    }
+  }
+
+  // wait 1s until next update (also DHT limitation)
+  delay(1000);
 }
 
 //---------------------------------------------------
@@ -431,7 +467,7 @@ void mqtt_reconnect() {
       doc["ip"] = WiFi.localIP().toString();  //.c_str();
       doc["relays"] = c_relays;
       doc["dhttype"] = c_dhttype;
-      doc["onewire"] = c_onewire;
+      doc["pirsensor"] = c_pirsensor;
       doc["tempadjust"] = ftoa(tempAdjust, tmp, 2);
 
       size_t n = serializeJson(doc, msg);
