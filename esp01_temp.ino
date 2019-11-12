@@ -21,7 +21,7 @@
 
 #define DEBUG   0
 
-// NOTE: You cannot use both PIR, DHT & Dallas temperature sensors at the same time
+// NOTE: You cannot use both PIR, DHT & Dallas temperature sensors at the same time without changing #defines
 
 // Dallas DS18B20 temperature sensors
 #define TEMPERATURE_PRECISION 9
@@ -41,7 +41,12 @@ int PIRPIN = 2;         // pin used for PIR
 int PIRState = 0;       // initialize PIR state
 
 // relay pins
-const int relays[4] = {3, 2, 4, 5};     // relay pins (GPIO0, GPIO2, RX, TX)
+const int relays[4] = {0, 2, 3, 1};     // relay pins (GPIO0, GPIO2, RX, TX)
+// NOTE: GPIO0 has to be HIGH for a normal boot (LOW for flashing).
+// GPIO2 is HIGH at boot.
+// Also, some debug output is sent to TX during boot.
+// Add 330 Ohm resistor between RX pin and USB driver, to prevent shorting.
+// Check: https://www.instructables.com/id/How-to-use-the-ESP8266-01-pins/
 int relayState[4] = {0, 0, 0, 0};       // relay states
 int numRelays = 0;                      // number of relays used
 // uncomment next line for saving relay states to EEPROM
@@ -52,7 +57,7 @@ char mqtt_server[40] = "192.168.70.11";
 char mqtt_port[7]    = "1883";
 char username[33]    = "";
 char password[33]    = "";
-char MQTTBASE[16]    = "shellies"; // use shellies for Shelly MQTT Domoticz plugin integration
+char MQTTBASE[16]    = "temp"; // use shellies for Shelly MQTT Domoticz plugin integration
 
 char c_relays[2]     = "0";
 char c_dhttype[8]    = "none";
@@ -250,11 +255,6 @@ void setup() {
 
   if ( numRelays > 0 ) {
     // initialize relay pins
-    if ( numRelays > 2 ) {
-      // change RX/TX pins into GPIO output pins (for relays)
-      pinMode(3, OUTPUT);     // RX -> GPIO1
-      pinMode(4, OUTPUT);     // TX -> GPIO3
-    }
     #ifdef EEPROMSAVE
     // 10th byte contain 8 relays (bits) worth of initial states
     int initRelays = EEPROM.read(9);
@@ -439,6 +439,7 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
       sprintf(msg, relayState[relayId]?"on":"off");
       client.publish(outTopic, msg);
 
+      #ifdef EEPROMSAVE
       // permanently store relay states to non-volatile memory
       int b=0;
       for ( int i=numRelays; i>0; i-- ) {
@@ -448,6 +449,7 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
       EEPROM.write(9,b);
       EEPROM.commit();
       EEPROM.end();
+      #endif
     }
   }
 }
