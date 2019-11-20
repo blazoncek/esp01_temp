@@ -45,7 +45,7 @@ const int relays[4] = {0, 2, 3, 1};     // relay pins (GPIO0, GPIO2, RX, TX)
 // NOTE: GPIO0 has to be HIGH for a normal boot (LOW for flashing).
 // GPIO2 is HIGH at boot.
 // Also, some debug output is sent to TX during boot.
-// Add 330 Ohm resistor between RX pin and USB driver, to prevent shorting.
+// Add 330/470 Ohm resistor between RX pin and USB driver, to prevent shorting.
 // Check: https://www.instructables.com/id/How-to-use-the-ESP8266-01-pins/
 int relayState[4] = {0, 0, 0, 0};       // relay states
 int numRelays = 0;                      // number of relays used
@@ -240,7 +240,7 @@ void setup() {
 
     // clear 10 bytes from EEPROM
     EEPROM.begin(10);
-    EEPROM.put(10, "0.0\0\0\0\0\0\0\0");
+    EEPROM.put(0, "0.0\0\0\0\0\0\0\0");
     EEPROM.commit();
     EEPROM.end();
     delay(120);
