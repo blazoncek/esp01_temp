@@ -13,13 +13,17 @@
 #include <DNSServer.h>            //Local DNS Server used for redirecting all requests to the configuration portal
 #include <ESP8266WebServer.h>     //Local WebServer used to serve the configuration portal
 #include <WiFiManager.h>          //https://github.com/tzapu/WiFiManager WiFi Configuration Magic
+
+#define MQTT_MAX_PACKET_SIZE 1024
 #include <PubSubClient.h>
+
 #include <ArduinoJson.h>          //https://github.com/bblanchon/ArduinoJson
+
 #include "DHT.h"
 #include <OneWire.h>
 #include <DallasTemperature.h>
 
-#define DEBUG   0
+#define DEBUG   1
 
 // NOTE: You cannot use both PIR, DHT & Dallas temperature sensors at the same time without changing #defines
 
@@ -32,7 +36,7 @@ DeviceAddress *thermometers[10];  // arrays to hold device addresses (up to 10)
 int numThermometers = 0;
 
 // DHT type temperature/humidity sensors
-#define DHTPIN  2           // what pin we're connected to (default GPIO2=2, GPIO0=3, RX=4, TX=5)
+#define DHTPIN  2           // what pin we're connected to (default GPIO2=2, GPIO0=0, RX=3, TX=1)
 float tempAdjust = 0.0;     // temperature adjustment for wacky DHT sensors (retrieved from EEPROM)
 DHT *dht = NULL;            // DHT11, DHT22, DHT21, none(0)
 
@@ -57,16 +61,17 @@ char mqtt_server[40] = "192.168.70.11";
 char mqtt_port[7]    = "1883";
 char username[33]    = "";
 char password[33]    = "";
-char MQTTBASE[16]    = "temp"; // use shellies for Shelly MQTT Domoticz plugin integration
+char MQTTBASE[16]    = "sensors"; // use shellies for Shelly MQTT Domoticz plugin integration
 
 char c_relays[2]     = "0";
 char c_dhttype[8]    = "none";
 char c_pirsensor[2]  = "0";
+char c_idx[4]        = "0";         // domoticz switch/sensor IDX
 
 // flag for saving data from WiFiManager
 bool shouldSaveConfig = false;
 
-long lastMsg = 0;
+unsigned long lastMsg = 0;
 char msg[256];
 char mac_address[16];
 char outTopic[64];  // add MAC address in WiFi setup code
@@ -85,18 +90,53 @@ void saveConfigCallback ();
 //-----------------------------------------------------------
 // main setup
 void setup() {
-  char str[11];
-  delay(5000);
+  char str[32];
+  delay(3000);
 
+  #if DEBUG
+  Serial.begin(115200);
+  #else
   // Initialize the BUILTIN_LED pin as an output & set initial state LED on
   pinMode(BUILTIN_LED, OUTPUT);
   digitalWrite(BUILTIN_LED, LOW);
+  #endif
 
   String WiFiMAC = WiFi.macAddress();
   WiFiMAC.replace(":","");
   WiFiMAC.toCharArray(mac_address, 16);
   // Create client ID from MAC address
-  sprintf(clientId, "esp01s-%s", &mac_address[6]);
+  sprintf(clientId, "esp-%s", &mac_address[6]);
+
+  // request 20 bytes from EEPROM
+  EEPROM.begin(20);
+
+  #if DEBUG
+  Serial.println("");
+  Serial.print("EEPROM data: ");
+  #endif
+  for ( int i=0; i<20; i++ ) {
+    str[i] = EEPROM.read(i);
+    #if DEBUG
+    Serial.print(str[i], HEX);
+    Serial.print(":");
+    #endif
+  }
+  #if DEBUG
+  Serial.print(" (");
+  Serial.print(str);
+  Serial.println(")");
+  #endif
+
+  EEPROM.commit();
+  EEPROM.end();
+  
+  if ( strncmp(str,"esp",3) == 0 ) {
+    #if DEBUG
+    Serial.println("Converting.");
+    #endif
+    sscanf(str,"esp%3s%-7s%1s%3.1f", c_idx, c_dhttype, c_relays, tempAdjust);
+  }
+  delay(120);
 
 //----------------------------------------------------------
   //read configuration from FS json
@@ -118,11 +158,13 @@ void setup() {
           strcpy(mqtt_port, doc["mqtt_port"]);
           strcpy(username, doc["username"]);
           strcpy(password, doc["password"]);
-          strcpy(password, doc["base"]);
-
+          strcpy(MQTTBASE, doc["base"]);
+/*
           strcpy(c_relays, doc["relays"]);
           strcpy(c_dhttype, doc["dhttype"]);
           strcpy(c_pirsensor, doc["pirsensor"]);
+          strcpy(c_idx, doc["idx"]);
+*/
         } else {
         }
       }
@@ -145,6 +187,7 @@ void setup() {
   WiFiManagerParameter custom_relays("relays", "Number of relays (0-4)", c_relays, 1);
   WiFiManagerParameter custom_dhttype("dhttype", "Temp. sensor type (DHT11,DHT22,DS18B20,none)", c_dhttype, 7);
   WiFiManagerParameter custom_pirsensor("pirsensor", "PIR sensor enabled (0/1)", c_pirsensor, 1);
+  WiFiManagerParameter custom_idx("idx", "Domoticz switch IDX", c_idx, 3);
 
   // WiFiManager
   // Local intialization. Once its business is done, there is no need to keep it around
@@ -169,6 +212,7 @@ void setup() {
   wifiManager.addParameter(&custom_relays);
   wifiManager.addParameter(&custom_dhttype);
   wifiManager.addParameter(&custom_pirsensor);
+  wifiManager.addParameter(&custom_idx);
 
   // set minimum quality of signal so it ignores AP's under that quality
   // defaults to 8%
@@ -200,6 +244,7 @@ void setup() {
   strcpy(c_relays, custom_relays.getValue());
   strcpy(c_dhttype, custom_dhttype.getValue());
   strcpy(c_pirsensor, custom_pirsensor.getValue());
+  strcpy(c_idx, custom_idx.getValue());
 
   numRelays = max(min(atoi(c_relays),4),0);
   c_relays[0] = '0' + numRelays;
@@ -219,45 +264,60 @@ void setup() {
 
   //save the custom parameters to FS
   if ( shouldSaveConfig ) {
+    #if DEBUG
+    Serial.println("Saving FS data.");
+    #endif
     DynamicJsonDocument doc(1024);
     doc["mqtt_server"] = mqtt_server;
     doc["mqtt_port"] = mqtt_port;
     doc["username"] = username;
     doc["password"] = password;
     doc["base"] = MQTTBASE;
-
+/*
     doc["relays"] = c_relays;
     doc["dhttype"] = c_dhttype;
     doc["pirsensor"] = c_pirsensor;
-
+    doc["idx"] = c_idx;
+*/
     File configFile = SPIFFS.open("/config.json", "w");
     if (!configFile) {
       // failed to open config file for writing
     } else {
       serializeJson(doc, configFile);
       configFile.close();
+      #if DEBUG
+      serializeJson(doc, Serial);
+      #endif
     }
 
-    // clear 10 bytes from EEPROM
-    EEPROM.begin(10);
-    EEPROM.put(0, "0.0\0\0\0\0\0\0\0");
+    #if DEBUG
+    Serial.println("Saving EEPROM data.");
+    #endif
+    // clear 20 bytes from EEPROM
+    sprintf(str,"esp%3s%-7s%1s%3.1f", c_idx, c_dhttype, c_relays, tempAdjust);
+    EEPROM.begin(20);
+    for ( int i=0; i<19; i++ ) {
+      EEPROM.write(i, str[i]);
+    }
     EEPROM.commit();
     EEPROM.end();
     delay(120);
   }
 //----------------------------------------------------------
 
+  #if !DEBUG
   // if connected set state LED off
   digitalWrite(BUILTIN_LED, HIGH);
+  #endif
 
-  // request 10 bytes from EEPROM
-  EEPROM.begin(10);
+  // request 20 bytes from EEPROM
+  EEPROM.begin(20);
 
   if ( numRelays > 0 ) {
     // initialize relay pins
     #ifdef EEPROMSAVE
-    // 10th byte contain 8 relays (bits) worth of initial states
-    int initRelays = EEPROM.read(9);
+    // 19th byte contain 8 relays (bits) worth of initial states
+    int initRelays = EEPROM.read(19);
     #endif
     // relay states are stored in bits
     for ( int i=0; i<numRelays; i++ ) {
@@ -268,18 +328,20 @@ void setup() {
       digitalWrite(relays[i], relayState[i]? HIGH: LOW);
     }
   }
+
+  // done reading EEPROM
+  EEPROM.end();
   
+  #if DEBUG
+  Serial.println("Initializing sensors.");
+  #endif
+
   // set up temperature sensor (either DHT or Dallas)
   if ( strcpy(c_dhttype,"none")!=0 ) {
     
     if ( dht ) {
       // initialize DHT sensor
       dht->begin();
-
-      // get temperature adjustment fro EEPROM
-      char temp[8];
-      EEPROM.get(0,temp);
-      tempAdjust = atof(temp);  // temperature adjustment (set via MQTT message)
     } // DHT
   
     if ( oneWire ) {
@@ -304,9 +366,9 @@ void setup() {
     } // end oneWire
   } // end temperature sensors
 
-  // done reading EEPROM
-  EEPROM.end();
-
+  #if DEBUG
+  Serial.println("MQTT connection.");
+  #endif
   // initialize MQTT connection & provide callback function
   client.setServer(mqtt_server, atoi(mqtt_port));
   client.setCallback(mqtt_callback);
@@ -315,15 +377,16 @@ void setup() {
 //-----------------------------------------------------------
 // main loop
 void loop() {
-
+  char tmp[64];
+  
   if (!client.connected()) {
     mqtt_reconnect();
   }
   client.loop();
 
-  // publish status every 120s
+  // publish status every 60s
   long now = millis();
-  if ( now - lastMsg > 120000 ) {
+  if ( now - lastMsg > 60000 ) {
     lastMsg = now;
     
     if ( dht ) {
@@ -355,6 +418,19 @@ void loop() {
           sprintf(msg, "%.1f", tempAdjust);
           client.publish(outTopic, msg);
         }
+
+        if ( atoi(c_idx) ) {
+          // publish Domoticz API
+          DynamicJsonDocument doc(256);
+          doc["idx"] = c_idx;
+          doc["type"] = "command";
+          doc["param"] = "udevice";
+          doc["nvalue"] = 0;
+          sprintf(tmp, "%.1f;%.1f;0", t + tempAdjust, f + tempAdjust*(float)(9/5));
+          doc["svalue"] = tmp;
+          serializeJson(doc, msg);
+          client.publish("domoticz/in", msg);
+        }
       }
     }
 
@@ -368,6 +444,19 @@ void loop() {
           sprintf(outTopic, "%s/%s/temperature/%i", MQTTBASE, clientId, i);
         sprintf(msg, "%.1f", tempC);
         client.publish(outTopic, msg);
+
+        if ( atoi(c_idx) ) {
+          // publish Domoticz API
+          DynamicJsonDocument doc(256);
+          doc["idx"] = c_idx;
+          doc["type"] = "command";
+          doc["param"] = "udevice";
+          doc["nvalue"] = 0;
+          sprintf(tmp, "%.1f", tempC);
+          doc["svalue"] = tmp;
+          serializeJson(doc, msg);
+          client.publish("domoticz/in", msg);
+        }
       }
     }
 
@@ -382,74 +471,170 @@ void loop() {
       // may use Shelly MQTT API as (shellies/shellysense-MAC/sensor/motion)
       sprintf(outTopic, "%s/%s/sensor/motion", MQTTBASE, clientId);
       client.publish(outTopic, PIRState == HIGH? "1": "0");
+
+      if ( atoi(c_idx) ) {
+        // publish Domoticz API
+        DynamicJsonDocument doc(256);
+        doc["idx"] = c_idx;
+        doc["type"] = "command";
+        doc["param"] = "switchlight";
+        doc["switchcmd"] = PIRState ? "On" : "Off";
+        serializeJson(doc, msg);
+        client.publish("domoticz/in", msg);
+      }
     }
 
-  // end 120s reporting
+  // end 60s reporting
   }
   
   if ( atoi(c_pirsensor) ) {
     // detect motion and publish immediately
     int lPIRState = digitalRead(PIRPIN);
-    if (lPIRState != PIRState ) {
+    if ( lPIRState != PIRState ) {
       PIRState = lPIRState;
       sprintf(outTopic, "%s/%s/sensor/motion", MQTTBASE, clientId);
       client.publish(outTopic, PIRState == HIGH? "1": "0");
-    }
+
+      if ( atoi(c_idx) ) {
+        // publish Domoticz API
+        DynamicJsonDocument doc(256);
+        doc["idx"] = c_idx;
+        doc["type"] = "command";
+        doc["param"] = "switchlight";
+        doc["switchcmd"] = PIRState ? "On" : "Off";
+        serializeJson(doc, msg);
+        client.publish("domoticz/in", msg);
+      }    }
   }
 
-  // wait 1s until next update (also DHT limitation)
-  delay(1000);
+  // wait 250ms until next update (also DHT limitation)
+  delay(250);
 }
 
 //---------------------------------------------------
 // MQTT callback function
 void mqtt_callback(char* topic, byte* payload, unsigned int length) {
+  char tmp[80];
+  String newPayload;
+  
+  payload[length] = '\0'; // "just in case" fix
 
-  if ( strstr(topic,"/temperature/command") ) {
-    // insert temperature adjustment and store it into non-volatile memory
-    char tmp[8];
-    strncpy(tmp,(char*)payload,length>7? 7: length);
-    tmp[length>7? 7: length] = '\0'; // terminate string
-    float temp = atof(tmp);
-    if ( temp < 100.0 && temp > -100.0 ) {
-      tempAdjust = temp;
-      ftoa(tempAdjust, tmp, 2);
-      EEPROM.begin(10);
-      EEPROM.put(0, tmp);
-      EEPROM.commit();
-      EEPROM.end();
-    }
-  } else if ( strstr(topic,"/relay/") && strstr(topic,"/command") ) {
-    // topic contains relay command
+  // convert to String & int for easier handling
+  newPayload = String((char *)payload);
 
-    int relayId = (int)(*(strstr(topic,"/command")-1) - '0');  // get the relay id (0-3)
-    if ( relayId < numRelays ) {
-      if ( strncmp((char*)payload,"on",length)==0 ) {
-        // message is on
-        digitalWrite(relays[relayId], HIGH);  // Turn the relay on
-        relayState[relayId] = 1;
-      } else if ( strncmp((char*)payload,"off",length)==0 ) {
-        // message is off
-        digitalWrite(relays[relayId], LOW);  // Turn the relay off
-        relayState[relayId] = 0;
-      }
+  if ( strcmp(topic,"domoticz/out") == 0 ) {
 
-      // publish relay state
-      sprintf(outTopic, "%s/%s/relay/%i", MQTTBASE, clientId, relayId);
-      sprintf(msg, relayState[relayId]?"on":"off");
-      client.publish(outTopic, msg);
+    DynamicJsonDocument doc(2048);
+    deserializeJson(doc, payload);
+  
+    if ( doc["idx"] == atoi(c_idx) ) {
+      // proper IDX found
+      String action = doc["svalue1"];  // get status/value from Domoticz
+      int actionId = action.toInt();
 
-      #ifdef EEPROMSAVE
-      // permanently store relay states to non-volatile memory
-      int b=0;
-      for ( int i=numRelays; i>0; i-- ) {
-        b = (b<<1) | (relayState[i-1]&1);
-      }
-      EEPROM.begin(10);
-      EEPROM.write(9,b);
-      EEPROM.commit();
-      EEPROM.end();
+      #if DEBUG
+      Serial.print("Selected action: ");
+      Serial.println(action);
       #endif
+
+      // Perform action
+    }
+
+  } else if ( strstr(topic, MQTTBASE) ) {
+
+    if ( strstr(topic,"/temperature/command") ) {
+      
+      // insert temperature adjustment and store it into non-volatile memory
+      float temp = atof((char*)payload);
+      if ( temp < 100.0 && temp > -100.0 ) {
+        tempAdjust = temp;
+        sprintf(tmp, "esp%3s%-7s%1s%3.1f", c_idx, c_dhttype, c_relays, tempAdjust);
+        EEPROM.begin(20);
+        for ( int i=0; i<19; i++ ) {
+          EEPROM.write(i, tmp[i]);
+        }
+        EEPROM.commit();
+        EEPROM.end();
+      }
+      
+    } else if ( strstr(topic,"/relay/") && strstr(topic,"/command") ) {
+      // topic contains relay command
+  
+      int relayId = (int)(*(strstr(topic,"/command")-1) - '0');  // get the relay id (0-3)
+      if ( relayId < numRelays ) {
+        if ( strncmp((char*)payload,"on",length)==0 ) {
+          // message is on
+          digitalWrite(relays[relayId], HIGH);  // Turn the relay on
+          relayState[relayId] = 1;
+        } else if ( strncmp((char*)payload,"off",length)==0 ) {
+          // message is off
+          digitalWrite(relays[relayId], LOW);  // Turn the relay off
+          relayState[relayId] = 0;
+        }
+  
+        // publish relay state
+        sprintf(outTopic, "%s/%s/relay/%i", MQTTBASE, clientId, relayId);
+        sprintf(msg, relayState[relayId]?"on":"off");
+        client.publish(outTopic, msg);
+  
+        #ifdef EEPROMSAVE
+        // permanently store relay states to non-volatile memory
+        byte b=0;
+        for ( int i=numRelays; i>0; i-- ) {
+          b = (b<<1) | (relayState[i-1]&1);
+        }
+        EEPROM.begin(20);
+        EEPROM.write(19,b);
+        EEPROM.commit();
+        EEPROM.end();
+        #endif
+      }
+
+    } else if ( strstr(topic,"/command/idx") ) {
+      
+      sprintf(c_idx,"%d",max(min((int)newPayload.toInt(),999),1));
+      #if DEBUG
+      Serial.print("New idx: ");
+      Serial.println(c_idx);
+      #endif
+
+      // request 20 bytes from EEPROM
+      sprintf(tmp, "esp%3s%-7s%1s%3.1f", c_idx, c_dhttype, c_relays, tempAdjust);
+      EEPROM.begin(20);
+      for ( int i=0; i<19; i++ ) {
+        EEPROM.write(i, tmp[i]);
+      }
+      EEPROM.commit();
+      EEPROM.end();
+      delay(120);
+  
+    } else if ( strstr(topic,"/command/restart") ) {
+
+      // restart ESP
+      ESP.reset();
+      delay(1000);
+      
+    } else if ( strstr(topic,"/command/reset") ) {
+
+      // erase 20 bytes from EEPROM
+      EEPROM.begin(20);
+      for ( int i=0; i<20; i++ ) {
+        EEPROM.write(i, '\0');
+      }
+      EEPROM.commit();
+      EEPROM.end();
+      delay(120);  // wait for write to complete
+
+      // clean FS
+      SPIFFS.format();
+
+      // clear WiFi data & disconnect
+      WiFi.disconnect();
+
+      // restart ESP
+      ESP.reset();
+      delay(1000);
+      
     }
   }
 }
@@ -467,6 +652,7 @@ void mqtt_reconnect() {
       DynamicJsonDocument doc(256);
       doc["mac"] = WiFi.macAddress(); //.toString().c_str();
       doc["ip"] = WiFi.localIP().toString();  //.c_str();
+      doc["idx"] = c_idx;
       doc["relays"] = c_relays;
       doc["dhttype"] = c_dhttype;
       doc["pirsensor"] = c_pirsensor;
@@ -479,6 +665,7 @@ void mqtt_reconnect() {
       // ... and resubscribe
       sprintf(tmp, "%s/%s/#", MQTTBASE, clientId);
       client.subscribe(tmp);
+      client.subscribe("domoticz/out");
     } else {
       // Wait 5 seconds before retrying
       delay(5000);
