@@ -476,8 +476,7 @@ void loop() {
         // publish Domoticz API
         DynamicJsonDocument doc(256);
         doc["idx"] = c_idx;
-        doc["type"] = "command";
-        doc["param"] = "switchlight";
+        doc["command"] = "switchlight";
         doc["switchcmd"] = PIRState ? "On" : "Off";
         serializeJson(doc, msg);
         client.publish("domoticz/in", msg);
