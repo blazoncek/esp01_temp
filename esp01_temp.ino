@@ -23,7 +23,7 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
 
-#define DEBUG   1
+#define DEBUG   0
 
 // NOTE: You cannot use both PIR, DHT & Dallas temperature sensors at the same time without changing #defines
 
@@ -107,14 +107,14 @@ void setup() {
   // Create client ID from MAC address
   sprintf(clientId, "esp-%s", &mac_address[6]);
 
-  // request 20 bytes from EEPROM
-  EEPROM.begin(20);
+  // request 21 configuration bytes from EEPROM
+  EEPROM.begin(21);
 
   #if DEBUG
   Serial.println("");
   Serial.print("EEPROM data: ");
   #endif
-  for ( int i=0; i<20; i++ ) {
+  for ( int i=0; i<21; i++ ) {
     str[i] = EEPROM.read(i);
     #if DEBUG
     Serial.print(str[i], HEX);
@@ -127,21 +127,43 @@ void setup() {
   Serial.println(")");
   #endif
 
-  EEPROM.commit();
-  EEPROM.end();
-  
   if ( strncmp(str,"esp",3) == 0 ) {
     #if DEBUG
-    Serial.println("Converting.");
+    Serial.println("Converting EEPROM data.");
     #endif
-    sscanf(str,"esp%3s%-7s%1s%3.1f", c_idx, c_dhttype, c_relays, tempAdjust);
+    //sscanf(str,"esp%3s%-7s%1s%1s%3.1f", c_idx, c_dhttype, c_relays, c_pirsensor, tempAdjust);
+    strncpy(c_idx, &str[3], 3);
+    strncpy(c_dhttype, &str[6], 7);
+    for ( int i=0; i<7; i++ ) {
+      if ( c_dhttype[i]==' ' ) {
+        c_dhttype[i] = '\0';
+        break;
+      }
+    }
+    strncpy(c_relays, &str[13], 1);
+    strncpy(c_pirsensor, &str[14], 1);
+    tempAdjust = atof(&str[15]);
+    #if DEBUG
+    Serial.print("idx: ");
+    Serial.println(c_idx);
+    Serial.print("dhttype: ");
+    Serial.println(c_dhttype);
+    Serial.print("relays: ");
+    Serial.println(c_relays);
+    Serial.print("pirsensor: ");
+    Serial.println(c_pirsensor);
+    Serial.print("tempAdjust: ");
+    Serial.println(ftoa(tempAdjust, str, 1));
+    #endif
   }
-  delay(120);
 
 //----------------------------------------------------------
   //read configuration from FS json
   if ( SPIFFS.begin() ) {
     if ( SPIFFS.exists("/config.json") ) {
+      #if DEBUG
+      Serial.println("Reading SPIFFS data.");
+      #endif
       //file exists, reading and loading
       File configFile = SPIFFS.open("/config.json", "r");
       if ( configFile ) {
@@ -159,12 +181,19 @@ void setup() {
           strcpy(username, doc["username"]);
           strcpy(password, doc["password"]);
           strcpy(MQTTBASE, doc["base"]);
-/*
-          strcpy(c_relays, doc["relays"]);
-          strcpy(c_dhttype, doc["dhttype"]);
-          strcpy(c_pirsensor, doc["pirsensor"]);
-          strcpy(c_idx, doc["idx"]);
-*/
+
+          #if DEBUG
+          Serial.print("mqtt_server: ");
+          Serial.println(mqtt_server);
+          Serial.print("mqtt_port: ");
+          Serial.println(mqtt_port);
+          Serial.print("username: ");
+          Serial.println(username);
+          Serial.print("password: ");
+          Serial.println(password);
+          Serial.print("base: ");
+          Serial.println(MQTTBASE);
+          #endif
         } else {
         }
       }
@@ -246,6 +275,18 @@ void setup() {
   strcpy(c_pirsensor, custom_pirsensor.getValue());
   strcpy(c_idx, custom_idx.getValue());
 
+  #if DEBUG
+  Serial.println("WiFi Manager parameter check.");
+  Serial.print("idx: ");
+  Serial.println(c_idx);
+  Serial.print("dhttype: ");
+  Serial.println(c_dhttype);
+  Serial.print("relays: ");
+  Serial.println(c_relays);
+  Serial.print("pirsensor: ");
+  Serial.println(c_pirsensor);
+  #endif
+
   numRelays = max(min(atoi(c_relays),4),0);
   c_relays[0] = '0' + numRelays;
 
@@ -273,12 +314,7 @@ void setup() {
     doc["username"] = username;
     doc["password"] = password;
     doc["base"] = MQTTBASE;
-/*
-    doc["relays"] = c_relays;
-    doc["dhttype"] = c_dhttype;
-    doc["pirsensor"] = c_pirsensor;
-    doc["idx"] = c_idx;
-*/
+
     File configFile = SPIFFS.open("/config.json", "w");
     if (!configFile) {
       // failed to open config file for writing
@@ -293,14 +329,12 @@ void setup() {
     #if DEBUG
     Serial.println("Saving EEPROM data.");
     #endif
-    // clear 20 bytes from EEPROM
-    sprintf(str,"esp%3s%-7s%1s%3.1f", c_idx, c_dhttype, c_relays, tempAdjust);
-    EEPROM.begin(20);
-    for ( int i=0; i<19; i++ ) {
+    // clear 21 bytes from EEPROM
+    sprintf(str,"esp%3s%-7s%1s%1s%3.1f", c_idx, c_dhttype, c_relays, c_pirsensor, tempAdjust);
+    for ( int i=0; i<21; i++ ) {
       EEPROM.write(i, str[i]);
     }
     EEPROM.commit();
-    EEPROM.end();
     delay(120);
   }
 //----------------------------------------------------------
@@ -310,14 +344,11 @@ void setup() {
   digitalWrite(BUILTIN_LED, HIGH);
   #endif
 
-  // request 20 bytes from EEPROM
-  EEPROM.begin(20);
-
   if ( numRelays > 0 ) {
     // initialize relay pins
     #ifdef EEPROMSAVE
-    // 19th byte contain 8 relays (bits) worth of initial states
-    int initRelays = EEPROM.read(19);
+    // 21st byte contains 8 relays (bits) worth of initial states
+    int initRelays = EEPROM.read(20);
     #endif
     // relay states are stored in bits
     for ( int i=0; i<numRelays; i++ ) {
@@ -329,7 +360,7 @@ void setup() {
     }
   }
 
-  // done reading EEPROM
+  // done reading & writing EEPROM
   EEPROM.end();
   
   #if DEBUG
@@ -422,9 +453,8 @@ void loop() {
         if ( atoi(c_idx) ) {
           // publish Domoticz API
           DynamicJsonDocument doc(256);
-          doc["idx"] = c_idx;
-          doc["type"] = "command";
-          doc["param"] = "udevice";
+          doc["idx"] = atoi(c_idx);
+          doc["command"] = "udevice";
           doc["nvalue"] = 0;
           sprintf(tmp, "%.1f;%.1f;0", t + tempAdjust, f + tempAdjust*(float)(9/5));
           doc["svalue"] = tmp;
@@ -448,9 +478,8 @@ void loop() {
         if ( atoi(c_idx) ) {
           // publish Domoticz API
           DynamicJsonDocument doc(256);
-          doc["idx"] = c_idx;
-          doc["type"] = "command";
-          doc["param"] = "udevice";
+          doc["idx"] = atoi(c_idx);
+          doc["command"] = "udevice";
           doc["nvalue"] = 0;
           sprintf(tmp, "%.1f", tempC);
           doc["svalue"] = tmp;
@@ -463,8 +492,18 @@ void loop() {
     // may use Shelly MQTT API (shellies/shelly4pro-MAC/relay/i)
     for ( int i=0; i<numRelays; i++ ) {
       sprintf(outTopic, "%s/%s/relay/%i", MQTTBASE, clientId, i);
-      sprintf(msg, relayState[i]?"on":"off");
+      sprintf(msg, relayState[i] ? "on" : "off");
       client.publish(outTopic, msg);
+
+      if ( atoi(c_idx) ) {
+        // publish Domoticz API
+        DynamicJsonDocument doc(256);
+        doc["idx"] = atoi(c_idx) + i;
+        doc["command"] = "switchlight";
+        doc["switchcmd"] = relayState[i] ? "On" : "Off";
+        serializeJson(doc, msg);
+        client.publish("domoticz/in", msg);
+      }
     }
 
     if ( atoi(c_pirsensor) ) {
@@ -475,7 +514,7 @@ void loop() {
       if ( atoi(c_idx) ) {
         // publish Domoticz API
         DynamicJsonDocument doc(256);
-        doc["idx"] = c_idx;
+        doc["idx"] = atoi(c_idx);
         doc["command"] = "switchlight";
         doc["switchcmd"] = PIRState ? "On" : "Off";
         serializeJson(doc, msg);
@@ -491,15 +530,20 @@ void loop() {
     int lPIRState = digitalRead(PIRPIN);
     if ( lPIRState != PIRState ) {
       PIRState = lPIRState;
+      
+      #if DEBUG
+      Serial.print("PIR: ");
+      Serial.println(PIRState == HIGH? "1": "0");
+      #endif
+      
       sprintf(outTopic, "%s/%s/sensor/motion", MQTTBASE, clientId);
       client.publish(outTopic, PIRState == HIGH? "1": "0");
 
       if ( atoi(c_idx) ) {
         // publish Domoticz API
         DynamicJsonDocument doc(256);
-        doc["idx"] = c_idx;
-        doc["type"] = "command";
-        doc["param"] = "switchlight";
+        doc["idx"] = atoi(c_idx);
+        doc["command"] = "switchlight";
         doc["switchcmd"] = PIRState ? "On" : "Off";
         serializeJson(doc, msg);
         client.publish("domoticz/in", msg);
@@ -547,9 +591,9 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
       float temp = atof((char*)payload);
       if ( temp < 100.0 && temp > -100.0 ) {
         tempAdjust = temp;
-        sprintf(tmp, "esp%3s%-7s%1s%3.1f", c_idx, c_dhttype, c_relays, tempAdjust);
-        EEPROM.begin(20);
-        for ( int i=0; i<19; i++ ) {
+        sprintf(tmp, "esp%3s%-7s%1s%1s%3.1f", c_idx, c_dhttype, c_relays, c_pirsensor, tempAdjust);
+        EEPROM.begin(21);
+        for ( int i=0; i<20; i++ ) {
           EEPROM.write(i, tmp[i]);
         }
         EEPROM.commit();
@@ -582,8 +626,8 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
         for ( int i=numRelays; i>0; i-- ) {
           b = (b<<1) | (relayState[i-1]&1);
         }
-        EEPROM.begin(20);
-        EEPROM.write(19,b);
+        EEPROM.begin(21);
+        EEPROM.write(20,b);
         EEPROM.commit();
         EEPROM.end();
         #endif
@@ -597,10 +641,10 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
       Serial.println(c_idx);
       #endif
 
-      // request 20 bytes from EEPROM
-      sprintf(tmp, "esp%3s%-7s%1s%3.1f", c_idx, c_dhttype, c_relays, tempAdjust);
-      EEPROM.begin(20);
-      for ( int i=0; i<19; i++ ) {
+      // request 21 bytes from EEPROM
+      sprintf(tmp, "esp%3s%-7s%1s%1s%3.1f", c_idx, c_dhttype, c_relays, c_pirsensor, tempAdjust);
+      EEPROM.begin(21);
+      for ( int i=0; i<20; i++ ) {
         EEPROM.write(i, tmp[i]);
       }
       EEPROM.commit();
@@ -615,8 +659,8 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
       
     } else if ( strstr(topic,"/command/reset") ) {
 
-      // erase 20 bytes from EEPROM
-      EEPROM.begin(20);
+      // erase 21 bytes from EEPROM
+      EEPROM.begin(21);
       for ( int i=0; i<20; i++ ) {
         EEPROM.write(i, '\0');
       }
