@@ -9,6 +9,9 @@
 #include <FS.h>                   //this needs to be first, or it all crashes and burns...
 
 #include <ESP8266WiFi.h>
+#include <ESP8266mDNS.h>          // multicast DNS
+#include <WiFiUdp.h>              // UDP handling
+#include <ArduinoOTA.h>           // OTA updates
 #include <EEPROM.h>
 #include <DNSServer.h>            //Local DNS Server used for redirecting all requests to the configuration portal
 #include <ESP8266WebServer.h>     //Local WebServer used to serve the configuration portal
@@ -397,6 +400,44 @@ void setup() {
     } // end oneWire
   } // end temperature sensors
 
+  // OTA update setup
+  //ArduinoOTA.setPort(8266);
+  ArduinoOTA.setHostname(clientId);
+  //ArduinoOTA.setPassword("ota_password");
+  ArduinoOTA.onStart([]() {
+    String type;
+    if (ArduinoOTA.getCommand() == U_FLASH) {
+      type = F("sketch");
+    } else { // U_FS
+      type = F("filesystem");
+    }
+    #if DEBUG
+    Serial.print(F("Start updating "));
+    Serial.println(type);
+    #endif
+  });
+  ArduinoOTA.onEnd([]() {
+    #if DEBUG
+    Serial.println(F("\nEnd"));
+    #endif
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    #if DEBUG
+    Serial.printf_P(PSTR("Progress: %u%%\r"), (progress / (total / 100)));
+    #endif
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    #if DEBUG
+    Serial.printf_P(PSTR("Error[%u]: "), error);
+    if      (error == OTA_AUTH_ERROR)    Serial.println(F("Auth Failed"));
+    else if (error == OTA_BEGIN_ERROR)   Serial.println(F("Begin Failed"));
+    else if (error == OTA_CONNECT_ERROR) Serial.println(F("Connect Failed"));
+    else if (error == OTA_RECEIVE_ERROR) Serial.println(F("Receive Failed"));
+    else if (error == OTA_END_ERROR)     Serial.println(F("End Failed"));
+    #endif
+  });
+  ArduinoOTA.begin();
+
   #if DEBUG
   Serial.println("MQTT connection.");
   #endif
@@ -410,6 +451,9 @@ void setup() {
 void loop() {
   char tmp[64];
   
+  // handle OTA updates
+  ArduinoOTA.handle();
+
   if (!client.connected()) {
     mqtt_reconnect();
   }
@@ -547,7 +591,8 @@ void loop() {
         doc["switchcmd"] = PIRState ? "On" : "Off";
         serializeJson(doc, msg);
         client.publish("domoticz/in", msg);
-      }    }
+      }
+    }
   }
 
   // wait 250ms until next update (also DHT limitation)
