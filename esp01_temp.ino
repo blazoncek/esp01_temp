@@ -450,6 +450,8 @@ void setup() {
 // main loop
 void loop() {
   char tmp[64];
+  long now = millis();
+  static long lastPIRChg = 0;
   
   // handle OTA updates
   ArduinoOTA.handle();
@@ -459,8 +461,34 @@ void loop() {
   }
   client.loop();
 
+  if ( atoi(c_pirsensor) ) {
+    // detect motion and publish immediately
+    int lPIRState = digitalRead(PIRPIN);
+    if ( lPIRState != PIRState && (now - lastPIRChg > 60000 || lPIRState) ) {
+      lastPIRChg = now;
+      PIRState = lPIRState;
+      
+      #if DEBUG
+      Serial.print("PIR: ");
+      Serial.println(PIRState == HIGH? "1": "0");
+      #endif
+      
+      sprintf(outTopic, "%s/%s/sensor/motion", MQTTBASE, clientId);
+      client.publish(outTopic, PIRState == HIGH? "1": "0");
+
+      if ( atoi(c_idx) ) {
+        // publish Domoticz API
+        DynamicJsonDocument doc(256);
+        doc["idx"] = atoi(c_idx);
+        doc["command"] = "switchlight";
+        doc["switchcmd"] = PIRState ? "On" : "Off";
+        serializeJson(doc, msg);
+        client.publish("domoticz/in", msg);
+      }
+    }
+  }
+
   // publish status every 60s
-  long now = millis();
   if ( now - lastMsg > 60000 ) {
     lastMsg = now;
     
@@ -549,7 +577,9 @@ void loop() {
         client.publish("domoticz/in", msg);
       }
     }
-
+/*
+ * No need for status updates on PIR sensor
+ * 
     if ( atoi(c_pirsensor) ) {
       // may use Shelly MQTT API as (shellies/shellysense-MAC/sensor/motion)
       sprintf(outTopic, "%s/%s/sensor/motion", MQTTBASE, clientId);
@@ -565,36 +595,10 @@ void loop() {
         client.publish("domoticz/in", msg);
       }
     }
-
+*/
   // end 60s reporting
   }
   
-  if ( atoi(c_pirsensor) ) {
-    // detect motion and publish immediately
-    int lPIRState = digitalRead(PIRPIN);
-    if ( lPIRState != PIRState ) {
-      PIRState = lPIRState;
-      
-      #if DEBUG
-      Serial.print("PIR: ");
-      Serial.println(PIRState == HIGH? "1": "0");
-      #endif
-      
-      sprintf(outTopic, "%s/%s/sensor/motion", MQTTBASE, clientId);
-      client.publish(outTopic, PIRState == HIGH? "1": "0");
-
-      if ( atoi(c_idx) ) {
-        // publish Domoticz API
-        DynamicJsonDocument doc(256);
-        doc["idx"] = atoi(c_idx);
-        doc["command"] = "switchlight";
-        doc["switchcmd"] = PIRState ? "On" : "Off";
-        serializeJson(doc, msg);
-        client.publish("domoticz/in", msg);
-      }
-    }
-  }
-
   // wait 250ms until next update (also DHT limitation)
   delay(250);
 }
