@@ -619,17 +619,34 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
     DynamicJsonDocument doc(2048);
     deserializeJson(doc, payload);
   
-    if ( doc["idx"] == atoi(c_idx) ) {
-      // proper IDX found
-      String action = doc["svalue1"];  // get status/value from Domoticz
-      int actionId = action.toInt();
+    if ( doc["idx"] == atoi(c_idx) || (doc["idx"] > atoi(c_idx) && doc["idx"] < atoi(c_idx)+numRelays) ) {
+      // proper IDX found (for relays virtual switches have to be consecutive)
+      String saction = doc["svalue1"];  // get status/value from Domoticz
+      int sactionId = saction.toInt();
+      int nvalue = doc["nvalue"];       // get value from Domoticz
 
       #if DEBUG
       Serial.print("Selected action: ");
-      Serial.println(action);
+      Serial.println(saction);
       #endif
 
       // Perform action
+      for ( int i=0; i<numRelays; i++ ) {
+        if ( doc["idx"] == atoi(c_idx)+i ) {
+          if ( nvalue ) {
+            digitalWrite(relays[i], HIGH);  // Turn the relay on
+            relayState[i] = 1;
+          } else {
+            digitalWrite(relays[i], LOW);  // Turn the relay off
+            relayState[i] = 0;
+          }
+    
+          // publish relay state
+          sprintf(outTopic, "%s/%s/relay/%i", MQTTBASE, clientId, i);
+          sprintf(msg, relayState[i]?"on":"off");
+          client.publish(outTopic, msg);
+        }
+      }
     }
 
   } else if ( strstr(topic, MQTTBASE) ) {
