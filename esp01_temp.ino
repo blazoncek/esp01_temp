@@ -657,7 +657,7 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
       float temp = atof((char*)payload);
       if ( temp < 100.0 && temp > -100.0 ) {
         tempAdjust = temp;
-        sprintf(tmp, "esp%3s%-7s%1s%1s%3.1f", c_idx, c_dhttype, c_relays, c_pirsensor, tempAdjust);
+        sprintf(tmp, "esp%-3s%7s%1s%1s%3.1f", c_idx, c_dhttype, c_relays, c_pirsensor, tempAdjust);
         EEPROM.begin(21);
         for ( int i=0; i<20; i++ ) {
           EEPROM.write(i, tmp[i]);
@@ -699,16 +699,44 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
         #endif
       }
 
+    } else if ( strstr(topic,"/command/dht") ) {
+
+      strncpy(c_dhttype, "\0\0\0\0\0\0\0", 7);
+      if ( strncmp((char*)payload,"DHT11",5)==0 ) {
+        strncpy(c_dhttype, (const char *)payload, 5);
+      } else if ( strncmp((char*)payload,"DHT21",5)==0 ) {
+        strncpy(c_dhttype, (const char *)payload, 5);
+      } else if ( strncmp((char*)payload,"DHT22",5)==0 ) {
+        strncpy(c_dhttype, (const char *)payload, 5);
+      } else if ( strncmp((char*)payload,"DS18B20",7)==0 ) {
+        strncpy(c_dhttype, (const char *)payload, 7);
+      } else {
+        strcpy(c_dhttype,"none");
+      }
+      // request 21 bytes from EEPROM
+      sprintf(tmp, "esp%-3s%7s%1s%1s%3.1f", c_idx, c_dhttype, c_relays, c_pirsensor, tempAdjust);
+      EEPROM.begin(21);
+      for ( int i=0; i<20; i++ ) {
+        EEPROM.write(i, tmp[i]);
+      }
+      EEPROM.commit();
+      EEPROM.end();
+      delay(120);
+  
+      // restart ESP
+      ESP.reset();
+      delay(1000);
+      
     } else if ( strstr(topic,"/command/idx") ) {
       
-      sprintf(c_idx,"%d",max(min((int)newPayload.toInt(),999),1));
+      sprintf(c_idx,"%d",max(min((int)newPayload.toInt(),999),0));
       #if DEBUG
       Serial.print("New idx: ");
       Serial.println(c_idx);
       #endif
 
       // request 21 bytes from EEPROM
-      sprintf(tmp, "esp%3s%-7s%1s%1s%3.1f", c_idx, c_dhttype, c_relays, c_pirsensor, tempAdjust);
+      sprintf(tmp, "esp%-3s%7s%1s%1s%3.1f", c_idx, c_dhttype, c_relays, c_pirsensor, tempAdjust);
       EEPROM.begin(21);
       for ( int i=0; i<20; i++ ) {
         EEPROM.write(i, tmp[i]);
